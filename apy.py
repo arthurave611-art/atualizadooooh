@@ -949,6 +949,19 @@ elif st.session_state.etapa == "Mapa":
             "Limites das faixas (separados por vírgula, ex: 0,10,50,100,500):",
             disabled=(modo_classes != "Personalizado")
         )
+        usar_serie_geral = st.checkbox(
+            "Calcular as faixas usando todos os anos da série (cores comparáveis entre anos)",
+            value=True,
+            disabled=(modo_classes == "Personalizado"),
+            help=(
+                "Recomendado: em vez de recalcular quantis/Jenks só com os valores do ano "
+                "escolhido (o que muda a escala de cor a cada ano e pode até colapsar tudo "
+                "numa faixa só em anos com poucos casos), os limites das faixas são calculados "
+                "uma vez usando os valores de TODOS os anos disponíveis (mesma métrica/nível/"
+                "filtro). Assim o mapa de um ano fica comparável ao de outro ano — mesma cor "
+                "sempre representa a mesma faixa de valores."
+            ),
+        )
         destacar_zero = st.checkbox(
             "Tratar 'sem casos' (valor 0) como cor separada", value=True,
             help=(
@@ -991,52 +1004,77 @@ elif st.session_state.etapa == "Mapa":
 
             mapa_plot["id_join"] = limpar_codigo(mapa_plot["CD_MUN"])
 
-            mapa_dados = mapa_plot.merge(
-                df_sih_local[["id_join", ano]], on="id_join", how="left"
-            )
-            mapa_dados["casos"] = pd.to_numeric(mapa_dados[ano], errors="coerce").fillna(0)
+            anos_pop = colunas_de_ano(df_pop)
 
-            # ---------- Dicionário de população por nome (Região/UF) ----------
-            pop_lookup = dict(zip(
-                df_pop[COL_LOCAL_POP].map(normalizar_texto),
-                pd.to_numeric(df_pop[ano_pop_usado], errors="coerce")
-            ))
+            def calcular_mapa_dados(ano_x, incluir_geometria=True):
+                """Reproduz o pipeline (casos -> população -> métrica) para um
+                ano qualquer, reaproveitando o mesmo filtro geográfico e nível
+                de agregação já escolhidos. Usado tanto para o ano selecionado
+                (com geometria, pra desenhar o mapa) quanto pros demais anos da
+                série (sem geometria, só pra reunir os valores que alimentam as
+                faixas de cor "pensando na série geral")."""
+                ano_pop_x = ano_mais_proximo(str(ano_x), anos_pop)
+                base = mapa_plot if incluir_geometria else mapa_plot.drop(columns="geometry")
 
-            def buscar_populacao(nome):
-                return pop_lookup.get(normalizar_texto(nome), np.nan)
+                dados_x = base.merge(df_sih_local[["id_join", str(ano_x)]], on="id_join", how="left")
+                dados_x["casos"] = pd.to_numeric(dados_x[str(ano_x)], errors="coerce").fillna(0)
 
-            # ---------- Nível de agregação ----------
-            if nivel_agregacao == "Município":
-                if COL_CODIGO_POP:
-                    # Casamento por código IBGE (6 dígitos, sem DV) — população
-                    # de cada município individualmente, não mais aproximada
-                    # pela população do Estado inteiro.
-                    pop_por_codigo = df_pop[[COL_CODIGO_POP, ano_pop_usado]].copy()
-                    pop_por_codigo[COL_CODIGO_POP] = pop_por_codigo[COL_CODIGO_POP].astype(str).str.strip()
-                    pop_por_codigo = pop_por_codigo[pop_por_codigo[COL_CODIGO_POP] != ""]
-                    pop_por_codigo[ano_pop_usado] = pd.to_numeric(pop_por_codigo[ano_pop_usado], errors="coerce")
-                    pop_por_codigo = pop_por_codigo.rename(
-                        columns={COL_CODIGO_POP: "id_join", ano_pop_usado: "populacao"}
-                    )
-                    mapa_dados = mapa_dados.merge(pop_por_codigo, on="id_join", how="left")
+                pop_lookup_x = dict(zip(
+                    df_pop[COL_LOCAL_POP].map(normalizar_texto),
+                    pd.to_numeric(df_pop[ano_pop_x], errors="coerce")
+                ))
+
+                def buscar_pop_x(nome):
+                    return pop_lookup_x.get(normalizar_texto(nome), np.nan)
+
+                if nivel_agregacao == "Município":
+                    if COL_CODIGO_POP:
+                        pop_por_codigo = df_pop[[COL_CODIGO_POP, ano_pop_x]].copy()
+                        pop_por_codigo[COL_CODIGO_POP] = pop_por_codigo[COL_CODIGO_POP].astype(str).str.strip()
+                        pop_por_codigo = pop_por_codigo[pop_por_codigo[COL_CODIGO_POP] != ""]
+                        pop_por_codigo[ano_pop_x] = pd.to_numeric(pop_por_codigo[ano_pop_x], errors="coerce")
+                        pop_por_codigo = pop_por_codigo.rename(
+                            columns={COL_CODIGO_POP: "id_join", ano_pop_x: "populacao"}
+                        )
+                        dados_x = dados_x.merge(pop_por_codigo, on="id_join", how="left")
+                    else:
+                        dados_x["populacao"] = dados_x[COL_UF_MAPA].map(buscar_pop_x)
+                    dados_x["_area"] = dados_x["NM_MUN"] if "NM_MUN" in dados_x.columns else dados_x["id_join"]
+
+                elif nivel_agregacao == "Estado (UF)":
+                    if incluir_geometria:
+                        dados_x = dados_x.dissolve(by=COL_UF_MAPA, aggfunc={"casos": "sum"}).reset_index()
+                    else:
+                        dados_x = dados_x.groupby(COL_UF_MAPA, as_index=False)["casos"].sum()
+                    dados_x["populacao"] = dados_x[COL_UF_MAPA].map(buscar_pop_x)
+                    dados_x["_area"] = dados_x[COL_UF_MAPA]
+
+                else:  # Região
+                    if incluir_geometria:
+                        dados_x = dados_x.dissolve(by=COL_REGIAO_MAPA, aggfunc={"casos": "sum"}).reset_index()
+                    else:
+                        dados_x = dados_x.groupby(COL_REGIAO_MAPA, as_index=False)["casos"].sum()
+                    dados_x["populacao"] = dados_x[COL_REGIAO_MAPA].map(buscar_pop_x)
+                    dados_x["_area"] = dados_x[COL_REGIAO_MAPA]
+
+                if metrica == "Quantidade Absoluta":
+                    dados_x["valor_mapa"] = dados_x["casos"]
+                elif metrica == "Taxa Bruta":
+                    dados_x["valor_mapa"] = taxa_bruta(dados_x["casos"], dados_x["populacao"], base_taxa)
                 else:
-                    st.info(
-                        "O arquivo de população não tem coluna de código IBGE por município "
-                        "(`codigo_ibge`) — usando a população do Estado inteiro como aproximação "
-                        "para cada município (formato antigo)."
-                    )
-                    mapa_dados["populacao"] = mapa_dados[COL_UF_MAPA].map(buscar_populacao)
-                nome_col_area = "NM_MUN" if "NM_MUN" in mapa_dados.columns else "id_join"
+                    dados_x["valor_mapa"] = taxa_bayesiana(dados_x["casos"], dados_x["populacao"], base_taxa)
 
-            elif nivel_agregacao == "Estado (UF)":
-                mapa_dados = mapa_dados.dissolve(by=COL_UF_MAPA, aggfunc={"casos": "sum"}).reset_index()
-                mapa_dados["populacao"] = mapa_dados[COL_UF_MAPA].map(buscar_populacao)
-                nome_col_area = COL_UF_MAPA
+                return dados_x
 
-            else:  # Região
-                mapa_dados = mapa_dados.dissolve(by=COL_REGIAO_MAPA, aggfunc={"casos": "sum"}).reset_index()
-                mapa_dados["populacao"] = mapa_dados[COL_REGIAO_MAPA].map(buscar_populacao)
-                nome_col_area = COL_REGIAO_MAPA
+            if nivel_agregacao == "Município" and not COL_CODIGO_POP:
+                st.info(
+                    "O arquivo de população não tem coluna de código IBGE por município "
+                    "(`codigo_ibge`) — usando a população do Estado inteiro como aproximação "
+                    "para cada município (formato antigo)."
+                )
+
+            mapa_dados = calcular_mapa_dados(ano, incluir_geometria=True)
+            nome_col_area = "_area"
 
             areas_sem_pop = int(
                 ((mapa_dados["populacao"].isna()) | (mapa_dados["populacao"] <= 0)).sum()
@@ -1050,29 +1088,51 @@ elif st.session_state.etapa == "Mapa":
                     f"Estado(s)/Região(ões) envolvidos: {', '.join(nomes_sem_pop) if nomes_sem_pop else '(não identificado)'}."
                 )
 
-            # ---------- Cálculo da métrica ----------
-            if metrica == "Quantidade Absoluta":
-                mapa_dados["valor_mapa"] = mapa_dados["casos"]
-                fmt_legenda = ",.0f"
-            elif metrica == "Taxa Bruta":
-                mapa_dados["valor_mapa"] = taxa_bruta(mapa_dados["casos"], mapa_dados["populacao"], base_taxa)
-                fmt_legenda = ",.2f"
-            else:  # Taxa Bayesiana
-                mapa_dados["valor_mapa"] = taxa_bayesiana(mapa_dados["casos"], mapa_dados["populacao"], base_taxa)
-                fmt_legenda = ",.2f"
+            fmt_legenda = ",.0f" if metrica == "Quantidade Absoluta" else ",.2f"
 
             sem_dado = mapa_dados["valor_mapa"].isna()
+
+            # ---------- Faixas de cor pensando na série geral ----------
+            # Em vez de calcular quantis/Jenks só com os valores do ano escolhido
+            # (o que muda a escala a cada ano e pode colapsar tudo numa única
+            # faixa quando o ano tem poucos casos — típico de doenças raras em
+            # recortes pequenos), reunimos os valores de TODOS os anos da série
+            # (mesma métrica/nível/filtro) e calculamos os limites uma única vez.
+            bins_fixos = None
+            aviso_serie_geral = None
+            if modo_classes in ("Quantis automáticos", "Agrupamento Natural") and usar_serie_geral:
+                valores_pool = []
+                for ano_x in anos_anuais:
+                    dados_x = calcular_mapa_dados(ano_x, incluir_geometria=False)
+                    vals_x = dados_x["valor_mapa"].dropna()
+                    if destacar_zero:
+                        vals_x = vals_x[vals_x > 0]
+                    valores_pool.append(vals_x)
+                pool = pd.concat(valores_pool) if valores_pool else pd.Series(dtype=float)
+
+                if pool.nunique() >= 2:
+                    k_pool = min(n_classes, pool.nunique())
+                    try:
+                        if modo_classes == "Quantis automáticos":
+                            classif = mapclassify.Quantiles(pool.values, k=k_pool)
+                        else:
+                            classif = mapclassify.NaturalBreaks(pool.values, k=k_pool)
+                        bins_fixos = classif.bins.tolist()
+                    except Exception:
+                        bins_fixos = None
+                else:
+                    aviso_serie_geral = (
+                        "Mesmo olhando todos os anos da série, os valores válidos (>0, se "
+                        "'sem casos' estiver marcado como cor separada) não têm variação "
+                        "suficiente para montar faixas — não há como colorir por faixas aqui."
+                    )
 
             # ---------- Plot ----------
             fig, ax = plt.subplots(figsize=(largura, altura))
             dados_validos = mapa_dados.loc[~sem_dado, "valor_mapa"]
 
             def montar_scheme_kwargs(valores_para_classificar):
-                if modo_classes == "Quantis automáticos":
-                    return {"scheme": "Quantiles", "k": min(n_classes, max(1, valores_para_classificar.nunique()))}
-                elif modo_classes == "Agrupamento Natural":
-                    return {"scheme": "NaturalBreaks", "k": min(n_classes, max(1, valores_para_classificar.nunique()))}
-                else:
+                if modo_classes == "Personalizado":
                     try:
                         bins = sorted(float(x.strip()) for x in rupturas_manual.split(",") if x.strip() != "")
                         if len(bins) < 2:
@@ -1081,6 +1141,15 @@ elif st.session_state.etapa == "Mapa":
                     except Exception as e:
                         st.error(f"Limites personalizados inválidos: {e}")
                         st.stop()
+                if bins_fixos is not None:
+                    return {"scheme": "UserDefined", "classification_kwds": {"bins": bins_fixos}}
+                if modo_classes == "Quantis automáticos":
+                    return {"scheme": "Quantiles", "k": min(n_classes, max(1, valores_para_classificar.nunique()))}
+                else:
+                    return {"scheme": "NaturalBreaks", "k": min(n_classes, max(1, valores_para_classificar.nunique()))}
+
+            if aviso_serie_geral:
+                st.info(aviso_serie_geral)
 
             if destacar_zero:
                 mask_sem_dado = mapa_dados["valor_mapa"].isna()
@@ -1098,12 +1167,35 @@ elif st.session_state.etapa == "Mapa":
                     dados_zero.plot(ax=ax, color="#f2f2f2", edgecolor="black", linewidth=espessura_borda)
 
                 if not dados_com_valor.empty:
-                    plot_kwargs = dict(
-                        column="valor_mapa", ax=ax, legend=True, cmap=paleta,
-                        edgecolor="black", linewidth=espessura_borda,
-                    )
-                    plot_kwargs.update(montar_scheme_kwargs(dados_com_valor["valor_mapa"]))
-                    dados_com_valor.plot(**plot_kwargs)
+                    if dados_com_valor["valor_mapa"].nunique() < 2 and bins_fixos is None:
+                        cor_unica = plt.get_cmap(paleta)(0.6)
+                        dados_com_valor.plot(ax=ax, color=cor_unica, edgecolor="black",
+                                             linewidth=espessura_borda)
+                        valor_unico = dados_com_valor["valor_mapa"].iloc[0]
+                        st.info(
+                            f"Todas as áreas com casos neste recorte deram exatamente o mesmo "
+                            f"valor ({valor_unico:{fmt_legenda}}) — por isso não há faixas para "
+                            "colorir e o mapa saiu de uma cor só (em vez de sem cor nenhuma). "
+                            "Isso é comum com Taxa Bayesiana quando há poucos casos: a "
+                            "suavização não encontra variação real entre as áreas além do "
+                            "esperado por acaso, e leva tudo para a média do recorte. Tente "
+                            "Taxa Bruta, agregue mais anos, ou amplie a área geográfica."
+                        )
+                    else:
+                        if dados_com_valor["valor_mapa"].nunique() < 2:
+                            st.info(
+                                f"Neste ano, todas as áreas com casos deram exatamente o "
+                                f"mesmo valor ({dados_com_valor['valor_mapa'].iloc[0]:{fmt_legenda}}), "
+                                "então o mapa sai de uma cor só — mas usando a mesma escala "
+                                "de cor calculada para toda a série, então essa cor ainda é "
+                                "comparável à dos outros anos."
+                            )
+                        plot_kwargs = dict(
+                            column="valor_mapa", ax=ax, legend=True, cmap=paleta,
+                            edgecolor="black", linewidth=espessura_borda,
+                        )
+                        plot_kwargs.update(montar_scheme_kwargs(dados_com_valor["valor_mapa"]))
+                        dados_com_valor.plot(**plot_kwargs)
                 else:
                     st.info("Nenhuma área com valor acima de 0 para colorir por faixas.")
 
@@ -1124,18 +1216,43 @@ elif st.session_state.etapa == "Mapa":
                         **kwargs_legenda(posicao_legenda, fonte_legenda, desloc_x_legenda, desloc_y_legenda),
                     )
             else:
-                plot_kwargs = dict(
-                    column="valor_mapa",
-                    ax=ax,
-                    legend=True,
-                    cmap=paleta,
-                    edgecolor="black",
-                    linewidth=espessura_borda,
-                    missing_kwds={"color": "lightgrey", "edgecolor": "black",
-                                  "linewidth": espessura_borda, "hatch": "///", "label": "Sem dado"},
-                )
-                plot_kwargs.update(montar_scheme_kwargs(dados_validos))
-                mapa_dados.plot(**plot_kwargs)
+                if len(dados_validos) > 0 and dados_validos.nunique() < 2 and bins_fixos is None:
+                    if sem_dado.any():
+                        mapa_dados[sem_dado].plot(ax=ax, color="lightgrey", edgecolor="black",
+                                                   linewidth=espessura_borda, hatch="///")
+                    cor_unica = plt.get_cmap(paleta)(0.6)
+                    mapa_dados[~sem_dado].plot(ax=ax, color=cor_unica, edgecolor="black",
+                                                linewidth=espessura_borda)
+                    valor_unico = dados_validos.iloc[0]
+                    st.info(
+                        f"Todas as áreas com dado neste recorte deram exatamente o mesmo valor "
+                        f"({valor_unico:{fmt_legenda}}) — por isso não há faixas para colorir e "
+                        "o mapa saiu de uma cor só (em vez de sem cor nenhuma). Isso é comum com "
+                        "Taxa Bayesiana quando há poucos casos: a suavização não encontra "
+                        "variação real entre as áreas além do esperado por acaso, e leva tudo "
+                        "para a média do recorte. Tente Taxa Bruta, agregue mais anos, ou amplie "
+                        "a área geográfica."
+                    )
+                else:
+                    if len(dados_validos) > 0 and dados_validos.nunique() < 2:
+                        st.info(
+                            f"Neste ano, todas as áreas com dado deram exatamente o mesmo "
+                            f"valor ({dados_validos.iloc[0]:{fmt_legenda}}), então o mapa sai "
+                            "de uma cor só — mas usando a mesma escala de cor calculada para "
+                            "toda a série, então essa cor ainda é comparável à dos outros anos."
+                        )
+                    plot_kwargs = dict(
+                        column="valor_mapa",
+                        ax=ax,
+                        legend=True,
+                        cmap=paleta,
+                        edgecolor="black",
+                        linewidth=espessura_borda,
+                        missing_kwds={"color": "lightgrey", "edgecolor": "black",
+                                      "linewidth": espessura_borda, "hatch": "///", "label": "Sem dado"},
+                    )
+                    plot_kwargs.update(montar_scheme_kwargs(dados_validos))
+                    mapa_dados.plot(**plot_kwargs)
 
                 legenda = ax.get_legend()
                 if legenda is not None:
