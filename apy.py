@@ -1010,36 +1010,28 @@ elif st.session_state.etapa == "Mapa":
                                   disabled=(metrica == "Quantidade Absoluta"))
 
         metodo_bayes_local = True
-        tipo_vizinhanca_eb = "Queen"
-        k_vizinhos_eb = 5
+        tipo_vizinhanca_eb = "Queen"  # fixo: padrão da literatura para EB Local/LISA
+        k_vizinhos_eb = 5  # não usado (só serve se tipo_vizinhanca_eb fosse "KNN")
         if metrica == "Taxa Bayesiana":
             st.caption(
                 "Local Empirical Bayes (Marshall 1991) — mesma lógica do GeoDa e do "
                 "CalculaAí (Aula 7): cada área é suavizada em direção à média dos "
-                "SEUS VIZINHOS, não à média do recorte inteiro (Global EB). Evita que "
-                "anos com poucos casos 'achatem' o mapa inteiro numa cor só."
+                "SEUS VIZINHOS (contiguidade Queen de 1ª ordem), não à média do "
+                "recorte inteiro (Global EB). Evita que anos com poucos casos "
+                "'achatem' o mapa inteiro numa cor só."
             )
             metodo_bayes_escolha = st.radio(
                 "Método de suavização Bayesiana:",
                 ["Local (por vizinhança — recomendado)", "Global (todo o recorte)"],
                 help=(
-                    "Local: cada área é suavizada com base nos vizinhos dela (matriz "
-                    "de vizinhança) — mostra variação espacial mesmo em anos com "
-                    "poucos casos. Global: todas as áreas são puxadas para a mesma "
-                    "média geral do recorte — mais simples, mas colapsa tudo numa "
-                    "faixa só quando há poucos casos no ano/recorte."
+                    "Local: cada área é suavizada com base nos vizinhos dela "
+                    "(contiguidade Queen) — mostra variação espacial mesmo em anos "
+                    "com poucos casos. Global: todas as áreas são puxadas para a "
+                    "mesma média geral do recorte — mais simples, mas colapsa tudo "
+                    "numa faixa só quando há poucos casos no ano/recorte."
                 ),
             )
             metodo_bayes_local = metodo_bayes_escolha.startswith("Local")
-            if metodo_bayes_local:
-                tipo_vizinhanca_eb = st.selectbox(
-                    "Tipo de vizinhança (Bayesiano Local):", ["Queen", "Rook", "KNN"],
-                    key="tipo_vizinhanca_eb_mapa",
-                )
-                k_vizinhos_eb = st.slider(
-                    "Número de vizinhos (K) — só para KNN:", 1, 20, 5,
-                    disabled=(tipo_vizinhanca_eb != "KNN"), key="k_vizinhos_eb_mapa",
-                )
 
         st.subheader("Classificação das cores")
         modo_classes = st.radio(
