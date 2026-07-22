@@ -166,6 +166,83 @@ def taxa_bayesiana(casos: pd.Series, pop: pd.Series, base: int) -> pd.Series:
     return r_eb * base
 
 
+def taxa_bayesiana_local(casos: pd.Series, pop: pd.Series, base: int,
+                          pesos_espaciais) -> pd.Series:
+    """
+    Suavização Bayesiana Empírica LOCAL (Local Empirical Bayes, Marshall 1991)
+    — a mesma lógica usada pelo GeoDa e pelo CalculaAí (Aula 7). Diferente do
+    Global EB acima (que puxa cada área para a média de TODO o recorte), aqui
+    a "janela de referência" de cada área i é ela mesma + seus vizinhos,
+    definidos pela matriz de pesos espaciais (ver `construir_pesos_espaciais`,
+    KNN/Queen/Rook):
+
+        janela_i = {i} ∪ vizinhos(i)
+        r_i      = O_i / P_i
+        m_i      = sum_{j em janela_i}(O_j) / sum_{j em janela_i}(P_j)
+        s2_i     = [sum_{j em janela_i} P_j*(r_j - m_i)² / sum_{j em janela_i}(P_j)] - m_i/mean(P_j em janela_i)
+        w_i      = s2_i / (s2_i + m_i/P_i)
+        EB_i     = w_i*r_i + (1-w_i)*m_i
+
+    Como m_i e w_i variam área a área (dependem só da vizinhança local, não
+    do estado/recorte inteiro), uma "bolsa" de municípios vizinhos com mais
+    casos pode aparecer diferente de outra com menos, mesmo num ano com
+    poucos casos no total — o que o Global EB não consegue mostrar (ele
+    colapsa tudo para a mesma média geral, "achatando" o mapa).
+
+    IMPORTANTE: `casos` e `pop` devem estar na MESMA ordem de linhas usada
+    para montar `pesos_espaciais` (índice posicional 0..n-1). Áreas sem
+    vizinho válido (ilhas) ou sem população (>0) caem de volta para a taxa
+    bruta da própria área, já que não há janela local para suavizar.
+    """
+    casos = casos.reset_index(drop=True).astype(float)
+    pop = pop.reset_index(drop=True).astype(float)
+    n = len(casos)
+
+    mask_pop = pop > 0
+    r = pd.Series(np.nan, index=range(n))
+    r[mask_pop] = casos[mask_pop] / pop[mask_pop]
+
+    eb_local = pd.Series(np.nan, index=range(n))
+    vizinhos = pesos_espaciais.neighbors
+
+    for i in range(n):
+        if not mask_pop.iloc[i]:
+            continue
+
+        vizinhos_i = [j for j in vizinhos.get(i, []) if j < n and mask_pop.iloc[j]]
+        janela = [i] + vizinhos_i
+
+        if len(janela) <= 1:
+            eb_local.iloc[i] = r.iloc[i]
+            continue
+
+        pop_janela = pop.iloc[janela]
+        casos_janela = casos.iloc[janela]
+        total_pop_j = pop_janela.sum()
+
+        if total_pop_j <= 0:
+            eb_local.iloc[i] = r.iloc[i]
+            continue
+
+        m_i = casos_janela.sum() / total_pop_j
+        media_pop_j = pop_janela.mean()
+        r_janela = casos_janela / pop_janela
+
+        s2_i = (pop_janela * (r_janela - m_i) ** 2).sum() / total_pop_j - (m_i / media_pop_j)
+        if s2_i < 0 or pd.isna(s2_i):
+            s2_i = 0.0
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w_i = s2_i / (s2_i + (m_i / pop.iloc[i]))
+        if pd.isna(w_i):
+            w_i = 0.0
+        w_i = min(max(w_i, 0.0), 1.0)
+
+        eb_local.iloc[i] = w_i * r.iloc[i] + (1 - w_i) * m_i
+
+    return eb_local * base
+
+
 # ----------------------------------------------------------------------
 # FUNÇÕES AUXILIARES — posição/tamanho customizável da legenda dos mapas
 # (usado nos módulos Mapas Coropléticos e Espacial/LISA, para o usuário
@@ -932,6 +1009,38 @@ elif st.session_state.etapa == "Mapa":
         base_taxa = st.selectbox("Taxa por quantos habitantes:", [1000, 10000, 100000], index=2,
                                   disabled=(metrica == "Quantidade Absoluta"))
 
+        metodo_bayes_local = True
+        tipo_vizinhanca_eb = "Queen"
+        k_vizinhos_eb = 5
+        if metrica == "Taxa Bayesiana":
+            st.caption(
+                "Local Empirical Bayes (Marshall 1991) — mesma lógica do GeoDa e do "
+                "CalculaAí (Aula 7): cada área é suavizada em direção à média dos "
+                "SEUS VIZINHOS, não à média do recorte inteiro (Global EB). Evita que "
+                "anos com poucos casos 'achatem' o mapa inteiro numa cor só."
+            )
+            metodo_bayes_escolha = st.radio(
+                "Método de suavização Bayesiana:",
+                ["Local (por vizinhança — recomendado)", "Global (todo o recorte)"],
+                help=(
+                    "Local: cada área é suavizada com base nos vizinhos dela (matriz "
+                    "de vizinhança) — mostra variação espacial mesmo em anos com "
+                    "poucos casos. Global: todas as áreas são puxadas para a mesma "
+                    "média geral do recorte — mais simples, mas colapsa tudo numa "
+                    "faixa só quando há poucos casos no ano/recorte."
+                ),
+            )
+            metodo_bayes_local = metodo_bayes_escolha.startswith("Local")
+            if metodo_bayes_local:
+                tipo_vizinhanca_eb = st.selectbox(
+                    "Tipo de vizinhança (Bayesiano Local):", ["Queen", "Rook", "KNN"],
+                    key="tipo_vizinhanca_eb_mapa",
+                )
+                k_vizinhos_eb = st.slider(
+                    "Número de vizinhos (K) — só para KNN:", 1, 20, 5,
+                    disabled=(tipo_vizinhanca_eb != "KNN"), key="k_vizinhos_eb_mapa",
+                )
+
         st.subheader("Classificação das cores")
         modo_classes = st.radio(
             "Como dividir as faixas de cor:",
@@ -1061,6 +1170,11 @@ elif st.session_state.etapa == "Mapa":
                     dados_x["valor_mapa"] = dados_x["casos"]
                 elif metrica == "Taxa Bruta":
                     dados_x["valor_mapa"] = taxa_bruta(dados_x["casos"], dados_x["populacao"], base_taxa)
+                elif metodo_bayes_local:
+                    # Local EB precisa da matriz de vizinhança, que só é montada
+                    # depois (com a geometria do ano selecionado) — preenchido
+                    # mais abaixo por `preencher_bayes_local`.
+                    dados_x["valor_mapa"] = np.nan
                 else:
                     dados_x["valor_mapa"] = taxa_bayesiana(dados_x["casos"], dados_x["populacao"], base_taxa)
 
@@ -1075,6 +1189,53 @@ elif st.session_state.etapa == "Mapa":
 
             mapa_dados = calcular_mapa_dados(ano, incluir_geometria=True)
             nome_col_area = "_area"
+
+            # ---------- Taxa Bayesiana Local: matriz de vizinhança ----------
+            # Construída UMA ÚNICA VEZ (a partir da geometria do ano selecionado)
+            # e reaproveitada para todos os anos da série: o filtro geográfico e
+            # o nível de agregação são os mesmos ano a ano, então a ordem das
+            # linhas (e portanto a vizinhança de cada área) não muda — só casos
+            # e população mudam de ano para ano.
+            pesos_eb = None
+            idx_validos_eb = []
+            preencher_bayes_local = lambda dados_x: pd.Series(np.nan, index=dados_x.index)
+            if metrica == "Taxa Bayesiana" and metodo_bayes_local:
+                geom_ok_eb = (
+                    mapa_dados.geometry.notna()
+                    & ~mapa_dados.geometry.is_empty
+                    & mapa_dados.geometry.is_valid
+                )
+                n_excluidos_eb = int((~geom_ok_eb).sum())
+                idx_validos_eb = np.where(geom_ok_eb.to_numpy())[0].tolist()
+
+                if len(idx_validos_eb) < 2:
+                    st.warning(
+                        "Poucas áreas com geometria válida para montar a matriz de "
+                        "vizinhança — a Taxa Bayesiana Local não pôde ser calculada "
+                        "aqui. Tente o método Global ou outro filtro geográfico."
+                    )
+                else:
+                    if n_excluidos_eb > 0:
+                        st.info(
+                            f"{n_excluidos_eb} área(s) com geometria nula/inválida "
+                            "ficaram de fora do cálculo da Taxa Bayesiana Local (não "
+                            "entram na matriz de vizinhança)."
+                        )
+                    with st.spinner("Calculando matriz de vizinhança (Bayesiano Local)..."):
+                        gdf_para_pesos = mapa_dados.iloc[idx_validos_eb].reset_index(drop=True)
+                        pesos_eb = construir_pesos_espaciais(
+                            gdf_para_pesos, tipo_vizinhanca_eb, k_vizinhos_eb
+                        )
+
+                    def preencher_bayes_local(dados_x, _pesos=pesos_eb, _idx=idx_validos_eb):
+                        resultado = pd.Series(np.nan, index=dados_x.index)
+                        sub_casos = dados_x["casos"].iloc[_idx].reset_index(drop=True)
+                        sub_pop = dados_x["populacao"].iloc[_idx].reset_index(drop=True)
+                        eb_vals = taxa_bayesiana_local(sub_casos, sub_pop, base_taxa, _pesos)
+                        resultado.iloc[_idx] = eb_vals.to_numpy()
+                        return resultado
+
+                mapa_dados["valor_mapa"] = preencher_bayes_local(mapa_dados)
 
             areas_sem_pop = int(
                 ((mapa_dados["populacao"].isna()) | (mapa_dados["populacao"] <= 0)).sum()
@@ -1104,6 +1265,8 @@ elif st.session_state.etapa == "Mapa":
                 valores_pool = []
                 for ano_x in anos_anuais:
                     dados_x = calcular_mapa_dados(ano_x, incluir_geometria=False)
+                    if metrica == "Taxa Bayesiana" and metodo_bayes_local:
+                        dados_x["valor_mapa"] = preencher_bayes_local(dados_x)
                     vals_x = dados_x["valor_mapa"].dropna()
                     if destacar_zero:
                         vals_x = vals_x[vals_x > 0]
